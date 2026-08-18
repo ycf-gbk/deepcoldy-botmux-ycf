@@ -963,7 +963,7 @@ describe('botmux internal callback buttons (🔊 语音总结 …) dropped from 
   it('Format B: real buildReplyCardFooter + real voice button — neither chrome leaks', () => {
     // End-to-end sanity with the REAL builders: footer signature strip (master)
     // and callback-button strip (this change) must jointly leave only the body.
-    const footer = buildReplyCardFooter({ recipientOpenIds: ['ou_55cda5a6c00f49eef42043a7746499b4'] })!;
+    const footer = buildReplyCardFooter({ recipientOpenIds: ['ou_example_user'] })!;
     const card = {
       body: { elements: [
         { tag: 'markdown', content: '修复已完成，详见上面。' },

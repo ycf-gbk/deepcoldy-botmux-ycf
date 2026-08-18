@@ -737,8 +737,9 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
     stateJsonPath: join(homedir(), '.claude.json'),
-    // alias（opus/sonnet/haiku）会被 Claude Code 解析成当前推荐的具体版本；具体 ID 锁版本。
-    modelChoices: ['opus', 'sonnet', 'haiku', 'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
+    // StepCode 当前网关返回的 Claude 模型。使用完整 ID，避免 opus/sonnet
+    // 别名随 Claude Code 推荐版本漂移，也避免展示已过时的 4-7/4-6 列表。
+    modelChoices: ['claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'],
   }, pathOverride ?? 'claude');
 }
 

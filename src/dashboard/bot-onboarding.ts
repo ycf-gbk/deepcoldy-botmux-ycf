@@ -143,7 +143,7 @@ export interface BotOnboardingSnapshot {
 export interface BotOnboardingInput {
   /** 飞书应用名称；留空时按待追加的 bots.json 行号生成 botmux-N。 */
   appName?: string;
-  /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 PersonalAgent/device-code 兼容模式。 */
+  /** 默认使用 PersonalAgent/device-code 兼容模式；web 是显式选择的普通企业应用路径。 */
   registrationMode?: 'web' | 'compat';
   /**
    * reuse: 使用表单已展示并确认的身份，缓存失效时不静默弹码；
@@ -1595,7 +1595,7 @@ export class BotOnboardingManager {
     // changes must not make the name drift midway through onboarding.
     const appName = resolveSetupAppName(input.appName, readBotsJsonOrEmpty(this.opts.botsJsonPath).length);
     this.patch(id, {
-      registrationMode: input.registrationMode ?? 'web',
+      registrationMode: input.registrationMode ?? 'compat',
       ...(input.requireCriticalScopesBeforeActivation
         ? { criticalScopeActivationRequired: true }
         : {}),
@@ -1709,7 +1709,7 @@ export class BotOnboardingManager {
     const auto = await this.runPermissionAutomation(id, result.appId, result.brand, {
       cliId,
       workingDir,
-      registrationMode: input.registrationMode ?? 'web',
+      registrationMode: input.registrationMode ?? 'compat',
       requireVerifiedEvents: input.requireCriticalScopesBeforeActivation === true,
     });
     // Every managed initial App first reaches one durable activation-pending

@@ -301,7 +301,7 @@ CoCo 目录拷贝；Riff 原生 parentTaskId 分支；`/fork` 同话题快速分
 | Dashboard 父子并存 | ✅ 源「记住暗号…」+ 分身「🔱 记住暗号…·fork测试群」两条独立 |
 | 同源多次 fork | ✅ 连续 fork 多个 child，各自独立、源始终不动 |
 
-### Claude 端（Relay-Claude2 = `cli_aae5948f82789ce4`，claude-code + super-relay-opus wrapper）
+### Claude 端（Relay-Claude2 = `cli_example_claude`，claude-code + super-relay-opus wrapper）
 
 | 验证点 | 结果 |
 |-|-|

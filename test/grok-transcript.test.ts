@@ -493,7 +493,7 @@ describe('discoverGrokSessions', () => {
     writeUpdates(botmuxReal, '/tmp/d', [
       userChunk(
         botmuxReal,
-        '<user_message>\nplease review\n</user_message>\n\n<sender type="user" open_id="ou_0123456789abcdef0123456789abcdef" />',
+        '<user_message>\nplease review\n</user_message>\n\n<sender type="user" open_id="ou_example_user" />',
         'e1',
       ),
     ]);

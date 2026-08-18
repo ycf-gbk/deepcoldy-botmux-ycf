@@ -54,16 +54,16 @@ describe('applyAllowedUsersResolve', () => {
 
   it('total transient failure with cache: keeps every configured entry from cache (owner not locked out)', () => {
     const out = applyAllowedUsersResolve({
-      rawEntries: ['on_928c2db360e48084f1ff72ebe161b1d6'],
-      previousResolvedMap: { on_928c2db360e48084f1ff72ebe161b1d6: 'ou_8a744395b1a13034de3e5e8ba6ba9715' },
-      resolveResult: result([], [['on_928c2db360e48084f1ff72ebe161b1d6', 'transient']], true),
+      rawEntries: ['on_example_user'],
+      previousResolvedMap: { on_example_user: 'ou_example_user' },
+      resolveResult: result([], [['on_example_user', 'transient']], true),
     });
 
-    expect(out.resolved).toEqual(['ou_8a744395b1a13034de3e5e8ba6ba9715']);
+    expect(out.resolved).toEqual(['ou_example_user']);
     expect(out.usedFallback).toBe(true);
     expect(out.failed).toBe(true);
     // map/resolved consistency: /revoke reverse-lookup must still work.
-    expect(out.map.get('on_928c2db360e48084f1ff72ebe161b1d6')).toBe('ou_8a744395b1a13034de3e5e8ba6ba9715');
+    expect(out.map.get('on_example_user')).toBe('ou_example_user');
   });
 
   it('MUST NOT revive a definitively-removed owner even if cache still has them', () => {

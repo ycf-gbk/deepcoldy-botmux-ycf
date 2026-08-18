@@ -348,7 +348,7 @@ describe('buildSchedulesCard', () => {
     });
 
     it('scope=global → row missing botName falls back to bot:<larkAppId suffix>', () => {
-      const onlyAppId = [task({ id: 'sch_x', name: 'noname-job', enabled: true, larkAppId: 'cli_aa8417992abbdcb0', botName: undefined })];
+      const onlyAppId = [task({ id: 'sch_x', name: 'noname-job', enabled: true, larkAppId: 'cli_example_bot', botName: undefined })];
       const json = buildSchedulesCard(
         onlyAppId,
         { invokerOpenId: INVOKER, locale: 'zh', page: 1, scope: 'global' },

@@ -20,10 +20,20 @@ export function prepareSessionSkillPrompt(opts: {
   workingDir: string;
   prompt: string;
   botPolicy: BotSkillPolicy | undefined;
+  /** Per-bot override. `off` suppresses the session catalog entirely. */
+  skillInjection?: 'global' | 'prompt' | 'off';
   pluginSkills?: SkillPackage[];
 }): PreparedSessionSkillPrompt {
   ensureSharedSkills();
   const sharedSkills = discoverSharedSkills();
+  // Claude-family sessions otherwise receive the complete shared botmux skill
+  // catalog on every cold start. Respect an explicit per-bot `off` setting so
+  // lightweight bots can keep only the routing system prompt and avoid
+  // exhausting the model context before the user's first turn.
+  if (opts.skillInjection === 'off') {
+    removeSessionSkillManifest(opts.sessionId);
+    return { prompt: opts.prompt, manifest: null };
+  }
   const allPluginSkills = [...(opts.pluginSkills ?? []), ...sharedSkills];
   if (!opts.botPolicy && allPluginSkills.length === 0) {
     removeSessionSkillManifest(opts.sessionId);

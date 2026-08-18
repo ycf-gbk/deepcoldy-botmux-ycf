@@ -36,7 +36,7 @@ function renderReplacementCatalog(manifest: SessionSkillManifest | null): string
 /** Prepare the shared Skills/MCP snapshot immediately before a real CLI spawn. */
 export function prepareCliPluginGeneration(opts: {
   sessionId: string;
-  bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills'>;
+  bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills' | 'skillInjection'>;
   global?: Pick<GlobalConfig, 'plugins'>;
   dataDir?: string;
   cliId: CliId;
@@ -66,6 +66,7 @@ export function prepareCliPluginGeneration(opts: {
     workingDir: opts.workingDir,
     prompt: opts.replacesPriorGeneration ? '' : opts.prompt,
     botPolicy: opts.bot.skills,
+    skillInjection: opts.bot.skillInjection,
     pluginSkills: pluginSkills.skills,
   });
   const delivery = prepareSkillDelivery(

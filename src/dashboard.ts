@@ -4097,7 +4097,9 @@ const server = createServer(async (req, res) => {
       if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
         return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web 或 compat' });
       }
-      const registrationMode = registrationModeRaw === 'compat' ? 'compat' as const : 'web' as const;
+      // PersonalAgent/device-code is the low-friction default. The ordinary
+      // Web enterprise-app flow remains available only when the client opts in.
+      const registrationMode = registrationModeRaw === 'web' ? 'web' as const : 'compat' as const;
       const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';
       if (registrationMode === 'web' && sessionModeRaw && sessionModeRaw !== 'reuse' && sessionModeRaw !== 'qr') {
         return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 必须是 reuse 或 qr' });

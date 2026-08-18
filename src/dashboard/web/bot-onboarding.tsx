@@ -727,7 +727,9 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
 
   const submitForm = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    void startOnboarding('web');
+    // Keep new-bot creation on the PersonalAgent path by default. The Web
+    // enterprise-app flow remains available through an explicit action.
+    void startOnboarding('compat');
   }, [startOnboarding]);
 
   const retry = useCallback((registrationMode: 'web' | 'compat') => {
