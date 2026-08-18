@@ -1,0 +1,372 @@
+import { existsSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { resolveCommand } from './registry.js';
+import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import type { CliAdapter, PtyHandle } from './types.js';
+import { traeStateDbPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
+import {
+  traexHistoryMatchDelta,
+  traexHistorySize,
+  findTraexRolloutSetByPid,
+  traexHistorySidIsOwned,
+} from '../../services/traex-transcript.js';
+import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
+import { delay } from '../../utils/timing.js';
+
+/**
+ * TRAE CLI (a.k.a. traex / traecli) adapter.
+ *
+ * TRAE is a Codex-family CLI — it shares the same bracketed-paste input
+ * protocol, `--dangerously-bypass-approvals-and-sandbox` / `--no-alt-screen`
+ * flags, `resume <uuid>` subcommand, and `›` prompt marker.
+ *
+ * The important difference from the upstream Codex adapter:
+ *   - Data lives under ~/.trae (not ~/.codex), configurable via TRAE_HOME.
+ *   - There is no global history.jsonl. Submit verification uses the threads
+ *     SQLite table as the authoritative session/path index, then requires an
+ *     exact role=user record in that rollout's post-submit byte delta.
+ *   - Skills are installed into ~/.trae/skills.
+ */
+
+// -- SQLite helpers (node:sqlite, Node 22+ experimental) -----------------
+
+type DatabaseSyncLike = {
+  prepare(sql: string): StatementSyncLike;
+  close(): void;
+};
+type StatementSyncLike = {
+  get(...params: unknown[]): any;
+  all(...params: unknown[]): any[];
+};
+
+let sqliteModule: { DatabaseSync: new (path: string) => DatabaseSyncLike } | null = null;
+let sqliteLoadAttempted = false;
+
+function loadSqlite(): typeof sqliteModule {
+  if (sqliteLoadAttempted) return sqliteModule;
+  sqliteLoadAttempted = true;
+  // node:sqlite is the built-in experimental SQLite binding available in
+  // Node 22+. The runtime may still reject it (older Node without the
+  // feature); callers treat that as verification-unavailable and fail closed.
+  // 必须走 createRequire：本包是 ESM（"type":"module"），裸 require 是
+  // ReferenceError —— 之前就是被这里的 try/catch 吞掉，导致生产 dist 里
+  // SQLite 提交验证/会话反查整条链路静默失效。
+  try {
+    const req = createRequire(import.meta.url);
+    sqliteModule = req('node:sqlite') as typeof sqliteModule;
+  } catch {
+    sqliteModule = null;
+  }
+  return sqliteModule;
+}
+
+function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
+  const mod = loadSqlite();
+  if (!mod) return null;
+  const dbPath = traeStateDbPath();
+  if (!existsSync(dbPath)) return null;
+  let db: DatabaseSyncLike | undefined;
+  try {
+    db = new mod.DatabaseSync(dbPath);
+    return fn(db);
+  } catch {
+    return null;
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
+}
+
+/** Adapter-side session-id ownership uses findTraexRolloutSetByPid +
+ * traexHistorySidIsOwned directly in writeInput (kept as raw three-state so the
+ * enumeration-unavailable case can fast-degrade). The authoritative persist /
+ * bridge-attach decision additionally re-checks worker-side via
+ * traexHistorySidOwnedByCurrentPid, whose pid resolution is richer than
+ * pty.cliPid (and covers the sandbox bwrap-supervisor case). */
+
+
+/** Scan threads backwards for the most recent thread whose first_user_message
+ *  references the botmux session id. Used by buildArgs(resume) and
+ *  buildResumeCommand to recover a TRAE-native session UUID from a botmux
+ *  session id. */
+function latestTraeSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
+  return withDb((db) => {
+    const rows = db.prepare(
+      'SELECT id, first_user_message AS firstMessage FROM threads ORDER BY created_at DESC LIMIT 200',
+    ).all() as { id: string; firstMessage?: string }[];
+    for (const r of rows) {
+      if (r.firstMessage && r.firstMessage.includes(botmuxSessionId)) return r.id;
+    }
+    return undefined;
+  }) ?? undefined;
+}
+
+// -------------------------------------------------------------------------
+
+/**
+ * TRAE/Codex sanitizes the environment inherited by model shell tools. Goal
+ * mode is file-backed, so the agent must receive these non-secret path vars or
+ * commands such as `cat $BOTMUX_GOAL_PATH` collapse to an empty argument and
+ * can hang on stdin. Forward only the goal contract, not the full worker env.
+ */
+const TRAEX_GOAL_ENV_KEYS = [
+  'BOTMUX_GOAL_PATH',
+  'BOTMUX_GOAL_INPUTS_PATH',
+  'BOTMUX_GOAL_OUTPUT_DIR',
+  'BOTMUX_GOAL_MANIFEST_PATH',
+  'BOTMUX_GOAL_ATTEMPT_DIR',
+  'BOTMUX_V3_GOAL',
+] as const;
+
+function goalEnvConfigArgs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const args: string[] = [];
+  for (const key of TRAEX_GOAL_ENV_KEYS) {
+    const value = env[key];
+    if (value === undefined) continue;
+    args.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
+  }
+  return args;
+}
+
+/**
+ * First-run "Legacy TRAE CLI data detected → migrate?" done-markers at the
+ * ~/.trae ROOT. traecli treats a marker's mere EXISTENCE (content/mode
+ * irrelevant — verified with a 0-byte `chmod 444` file) as "migration already
+ * done" and skips the interactive prompt. Under the file sandbox the migration
+ * SOURCE ~/.cache/coco is visible (baseline rw bind) but ~/.trae root is not, so
+ * without these the TUI wedges on a prompt no human can answer in goal mode.
+ *
+ * Exposed READ-ONLY (via sandboxReadonlyPaths → fs-policy readonlyRoots), NOT by
+ * widening authPaths to the whole ~/.trae: that root also holds hooks/ plugins/
+ * skills/ traecli.toml and authPaths compile to readWrite, which would let a
+ * chat-driven sandbox mutate shared hook/plugin code other bots execute.
+ *
+ *  · .coco-rollouts-migrated  → gates the "recent SESSIONS" prompt (the wedge)
+ *  · .coco-migrated           → gates the config-migration prompt (defence in depth)
+ * Both are dirt-cheap read-only single-file binds; a marker absent on this host is
+ * dropped by the worker's existence filter (keepExisting) so it can't cause a bind
+ * FAILURE — but note that is not the same as "goal-mode is fine": if the migration
+ * SOURCE (~/.cache/coco) exists while the marker is genuinely missing, the prompt
+ * legitimately fires. In practice the markers are written host-side once migration
+ * has run (the normal fleet state); this bind just makes that host truth visible
+ * through the sandbox instead of hidden behind the ~/.trae/cli-only carve-out.
+ */
+export const TRAE_MIGRATION_DONE_MARKERS = [
+  '~/.trae/.coco-rollouts-migrated',
+  '~/.trae/.coco-migrated',
+] as const;
+
+export function createTraexAdapter(pathOverride?: string): CliAdapter {
+  const rawBin = pathOverride ?? 'traex';
+  let cachedBin: string | undefined;
+  return {
+    id: 'traex',
+    // Whole ~/.trae/cli kept REAL: traex is codex-based and keeps the same SQLite
+    // state/log DBs there (state_*.sqlite / logs_*.sqlite) — under the deny-by-
+    // default file sandbox a path not in authPaths doesn't exist, so the DBs are
+    // unreachable / lack the fcntl locks SQLite needs (same failure as codex.ts).
+    // NOTE: we deliberately do NOT widen this to the whole ~/.trae — that root
+    // holds hooks/ plugins/ skills/ traecli.toml, and authPaths compile to
+    // readWrite (fs-policy `push(authPaths,'readWrite')`), so a chat-driven
+    // sandbox could mutate shared hook/plugin CODE that later bots (or the user's
+    // own non-sandboxed traecli) execute. The first-run migration markers that
+    // must be visible are exposed READ-ONLY via sandboxReadonlyPaths() instead.
+    authPaths: ['~/.trae/cli'],
+    sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
+
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {
+      // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
+      // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
+      // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
+      // shape, so this is identical to the codex adapter's branch.
+      if (remoteWsUrl && remoteThreadId) {
+        // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
+        // so an interactive update dialog would freeze the resume. TraeX shares
+        // codex's config schema; disable at the process level, never user-global.
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
+      }
+      const baseArgs = [
+        ...(!disableCliBypass ? [
+          '--dangerously-bypass-approvals-and-sandbox',
+          // Supported TRAE baseline 0.200.16+ has a second interactive
+          // "Hooks need review" gate
+          // after folder trust. Goal-mode workers have no human at their PTY,
+          // so without the automation-specific hook flag they never reach the
+          // prompt and `/goal` is never delivered. Gated by the same global
+          // `bypassHookTrust` toggle as codex (default ON, operator can disable —
+          // it trusts ALL hook sources, not only botmux's), still ANDed with the
+          // existing bypass decision: restricted bots must not gain hook trust.
+          ...(bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
+        ] : []),
+        '--no-alt-screen',
+        ...goalEnvConfigArgs(),
+      ];
+      if (model && model.trim()) baseArgs.push('--model', model.trim());
+      if (workingDir) baseArgs.push('-C', workingDir);
+      if (!resume) return baseArgs;
+
+      const traeSessionId = resumeSessionId ?? latestTraeSessionForBotmuxSession(sessionId);
+      if (!traeSessionId) return baseArgs;
+      return ['resume', ...baseArgs, traeSessionId];
+    },
+
+    buildResumeCommand({ sessionId, cliSessionId }) {
+      const sid = cliSessionId ?? latestTraeSessionForBotmuxSession(sessionId);
+      if (!sid) return null;
+      return `traex resume ${sid}`;
+    },
+
+    /** Import path: TRAE writes Codex-family rollout files under
+     *  `<TRAE_HOME>/cli/sessions`. */
+    listResumableSessions({ limit, exclude }) {
+      return discoverRolloutSessions(traeSessionsRoot(), limit, exclude);
+    },
+
+    async writeInput(pty: PtyHandle, content: string) {
+      // Same bracketed-paste strategy as the Codex adapter: multi-line user
+      // messages must not be split into separate turns by embedded \n.
+      const trySendEnter = (): boolean => {
+        try {
+          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
+          else pty.write('\r');
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
+      // Submit confirmation polls the global submit log history.jsonl, NOT the
+      // per-session rollout. TRAE is a type-ahead CLI: a message pasted while a
+      // turn is running is PARKED in TRAE's queue and only written to the
+      // rollout when the running turn dequeues it — which can exceed the
+      // worker's confirmation deadline and fire a false "submission couldn't be
+      // confirmed" warning even though TRAE received it. history.jsonl is
+      // written at SUBMIT time (verified empirically on traecli 0.200.19: a
+      // mid-turn follow-up appears here in ~1s while the rollout lags past 20s),
+      // so it confirms parked submits immediately. This mirrors the codex
+      // adapter, which polls its identically-shaped history.jsonl for the same
+      // reason. history.jsonl is created lazily on the first submit, so an
+      // absent file just means baseByte=0 and the first appended line matches.
+      const historyPath = traeHistoryPath();
+      const baseByte = traexHistorySize(historyPath);
+
+      const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
+        ? pty.cliPid
+        : undefined;
+
+      // Two separable facts, matched with two different scans:
+      //  - SUBMIT confirmation: any full-content match in the global submit log,
+      //    ownership-INDEPENDENT (a foreign-first line or unknown pid must never
+      //    suppress it, or the false "submission couldn't be confirmed" warning
+      //    this fix removes would come back).
+      //  - SESSION ID: history.jsonl is shared by every TRAE pane under one
+      //    TRAE_HOME, so a sibling's identical text can surface a foreign id.
+      //    Return the id ONLY when this pid provably owns that rollout.
+      //
+      // The three states of findTraexRolloutSetByPid are kept DISTINCT (not
+      // flattened through a boolean helper) because they drive different waits:
+      //   • undefined  → fd enumeration unavailable (no pid / not on Linux /
+      //     proc unreadable): we can never prove ownership, so there is no point
+      //     polling for an owned line — confirm the submit on any-text at once.
+      //   • Set (maybe empty) → enumeration works; an owned line may simply not
+      //     be on disk yet. KEEP polling for it and do NOT let a foreign-first
+      //     any-text hit end the loop early (a sibling's identical line can land
+      //     on poll N while our owned line appears on poll N+k — returning
+      //     no-SID on the first foreign sighting would permanently drop our id).
+      const ownedMatch = (owned: Set<string> | undefined) =>
+        traexHistoryMatchDelta(historyPath, baseByte, content, (sid) => traexHistorySidIsOwned(sid ?? '', owned));
+      const anyMatch = () => traexHistoryMatchDelta(historyPath, baseByte, content);
+
+      try {
+        if (pty.pasteText) pty.pasteText(content);
+        else pty.write('\x1b[200~' + content + '\x1b[201~');
+      } catch {
+        return { submitted: false };
+      }
+      await delay(200);
+      if (!trySendEnter()) return { submitted: false };
+
+      // `sawAnyText` remembers that the submit is proven (an any-text line
+      // exists) even while we keep polling for the OWNED line. Once set, no
+      // further Enter is needed — the message is in TRAE's log — so the loop only
+      // waits for the owned rollout to surface.
+      let sawAnyText = false;
+      // Prefer an owned id whenever enumeration is possible. Returns a final
+      // result to return now, or null to keep waiting. `final` relaxes the
+      // owned-wait: at budget end / on the worker recheck, confirm on any-text.
+      const resolve = (final: boolean) => {
+        const owned = cliPid ? findTraexRolloutSetByPid(cliPid) : undefined;
+        if (owned !== undefined) {
+          const m = ownedMatch(owned);
+          if (m.found && m.cliSessionId) return { submitted: true as const, cliSessionId: m.cliSessionId };
+          // Enumeration works but no owned line yet. Note submit evidence but
+          // keep waiting for the owned id — unless the budget is spent.
+          if (anyMatch().found) sawAnyText = true;
+          return final && sawAnyText ? { submitted: true as const } : null;
+        }
+        // Enumeration unavailable — can't prove ownership, so confirm the submit
+        // on any-text as soon as it appears (no owned line to wait for).
+        if (anyMatch().found) return { submitted: true as const };
+        return null;
+      };
+
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const confirmed = resolve(false);
+        if (confirmed) return confirmed;
+        await delay(800);
+        // Only re-Enter while the submit is still unproven; once any-text is
+        // seen the message is committed and we're merely waiting for the owned
+        // rollout fd, so another Enter would risk a duplicate submit.
+        if (!sawAnyText && !trySendEnter()) return { submitted: false };
+      }
+      const finalConfirmed = resolve(true);
+      if (finalConfirmed) return finalConfirmed;
+      // In-band budget exhausted. Hand the worker a recheck closure: a slow or
+      // busy TRAE may still append our history line after the retries gave up,
+      // and the worker re-scans on a delay before warning the user.
+      const recheck = () => resolve(true) ?? false;
+      return { submitted: false, recheck };
+    },
+
+    completionPattern: undefined,
+    // TRAE has shipped both the Codex-style `›` prompt and the Claude-style
+    // `❯` prompt; v0.200.7 also renders a "Context 100% left" status bar.
+    // Startup advisory / picker screens also use `❯ 1.` as a menu cursor, so
+    // exclude numbered selector rows; otherwise botmux flushes the first prompt
+    // into the advisory instead of TRAE's real composer.
+    readyPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
+    systemHints: BOTMUX_SHELL_HINTS,
+    // TRAE 0.200+ shares Codex's type-ahead behaviour: input submitted while
+    // a turn is running is parked and merged into the active turn.
+    supportsTypeAhead: true,
+    // task_complete in the per-session rollout is an explicit durable turn
+    // boundary; worker.ts drains it independently of screen-idle detection.
+    reliableTurnTerminal: true,
+    // TRAE's trust/advisory startup screens can accept stdin before the real
+    // composer exists, so the worker's 15s soft fallback must wait for the
+    // prompt marker. A hard cap in the worker still prevents permanent hangs.
+    deferFirstPromptTimeoutUntilReady: true,
+    altScreen: false,
+    skillsDir: '~/.trae/skills',
+    // Curated subset — the full catalogue has 27 models. `traex debug models`
+    // lists the rest; the setup flow always appends an "Other / custom"
+    // free-text option so users aren't locked out.
+    modelChoices: [
+      'Seed-Dogfooding-2.0',
+      'Doubao-Seed-2.0-Code',
+      'gpt-5.5',
+      'gpt-5',
+      'o3',
+      'Doubao_1_8',
+      'DeepSeek-V4-Pro',
+      'kimi-k2.6',
+    ],
+    // RPC mode bridges native AskUserQuestion directly. Keep the normal
+    // botmux-ask skill available too: TraeX sessions can fail closed to a
+    // standard PTY when RPC is unavailable, where native questions cannot
+    // reach the card bridge.
+    asksViaHook: false,
+  };
+}
+
+export const create = createTraexAdapter;

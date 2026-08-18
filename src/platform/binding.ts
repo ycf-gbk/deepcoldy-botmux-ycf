@@ -1,0 +1,112 @@
+// 平台绑定状态：存在 ~/.botmux/platform.json，记录这台机器绑到了哪个平台。
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import {
+  readSecureHostFileSync,
+  unlinkSecureHostFileSync,
+  UnsafeHostAuthorityFileError,
+  writeSecureHostFileSync,
+} from './secure-host-file.js';
+
+export interface PlatformBinding {
+  /** 平台对外地址 */
+  platformUrl: string;
+  /** 本机稳定标识（重绑保持不变） */
+  machineId: string;
+  /** 隧道凭证（自包含签名，平台验签） */
+  machineToken: string;
+  /** 机器展示名（默认机器名） */
+  name?: string;
+  /** 本机所属的平台团队（成员关系下沉到部署本地，平台零存储靠各机上报重组） */
+  teams?: PlatformTeam[];
+  /** @deprecated 遗留字段：仅为兼容旧 platform.json 而保留解析，运行期已不再读取。
+   *  隧道与所有平台连接现在都不传 family，交给 Node happy-eyeballs 自动选族；
+   *  bind 也不再把兜底成功的协议族落盘。 */
+  ipFamily?: 4 | 6;
+}
+
+export interface PlatformTeam {
+  teamId: string;
+  teamName: string;
+}
+
+export const PLATFORM_BINDING_PATH = join(homedir(), '.botmux', 'platform.json');
+
+export function readPlatformBinding(): PlatformBinding | null {
+  try {
+    const raw = readSecureHostFileSync(PLATFORM_BINDING_PATH);
+    if (raw === null) return null;
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj.platformUrl === 'string' && typeof obj.machineToken === 'string' && typeof obj.machineId === 'string') {
+      return obj as PlatformBinding;
+    }
+  } catch (error) {
+    // File-missing / parse failures still mean "unbound". Permission/symlink
+    // failures are different: treat as unbound for callers, but log a clear
+    // recovery hint so a hand-copied platform.json does not look like a silent
+    // drop-binding mystery.
+    if (error instanceof UnsafeHostAuthorityFileError) {
+      console.error(
+        `[platform-binding] 拒绝读取 ${PLATFORM_BINDING_PATH}: ${error.message}`
+        + '（请确保文件权限为 0600、路径不是符号链接，且 ~/.botmux 不可被组/其他用户写入；例: chmod 600 ~/.botmux/platform.json）',
+      );
+    }
+  }
+  return null;
+}
+
+export function writePlatformBinding(b: PlatformBinding): void {
+  writeSecureHostFileSync(PLATFORM_BINDING_PATH, `${JSON.stringify(b, null, 2)}\n`);
+}
+
+/**
+ * 解绑：删除本地平台绑定文件（~/.botmux/platform.json）。
+ * 平台侧 owner 点了「解绑」并吊销了 machine token 后，daemon 收到 unbound 消息时调用，
+ * 把本地凭证清干净——下次 `botmux bind` 重新写入即可重新绑定。文件不存在视为已清理。
+ */
+export function clearPlatformBinding(): void {
+  try {
+    unlinkSecureHostFileSync(PLATFORM_BINDING_PATH);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * 绑定平台后，本机对外可达的「机器子域」基址 `https://m-<machineId>.<平台域名>`，
+ * 平台会把该子域经隧道反代回本机 dashboard。域名从 binding.platformUrl 运行时推导
+ * （公开仓库不写死平台域名）；前缀 `m-` 是平台约定。未绑定返回 null。
+ */
+export function platformMachineBaseUrl(): string | null {
+  const b = readPlatformBinding();
+  if (!b) return null;
+  try {
+    const u = new URL(b.platformUrl);
+    return `${u.protocol}//m-${b.machineId}.${u.host}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 自建反代对外基址（`BOTMUX_PUBLIC_URL`）：没接中心平台、但自己用 nginx 等反代把
+ * dashboard 暴露到单一公网/内网域名时，设成 `http://botmux.example.com`
+ * （scheme + host[:port]，尾部斜杠会被去掉）。设了之后 dashboard / 卡片终端链接改吐
+ * `<基址>/…`、`<基址>/s/<sessionId>`，走 dashboard 前门、无需 per-bot 端口。未设返回
+ * null → 调用方回退本地 `host:port`。它与 {@link platformMachineBaseUrl} 是「中心平台
+ * vs 自建反代」两条对外基址来源；优先级由调用方定（平台 > 本函数 > 本地）。
+ */
+export function publicReverseProxyBaseUrl(): string | null {
+  const raw = process.env.BOTMUX_PUBLIC_URL?.trim();
+  if (!raw) return null;
+  return raw.replace(/\/+$/, '');
+}
+
+/** 更新本机平台团队列表并落盘（读最新 binding 防覆盖其它字段）。返回更新后的列表。 */
+export function setPlatformTeams(teams: PlatformTeam[]): PlatformTeam[] {
+  const b = readPlatformBinding();
+  if (!b) return [];
+  b.teams = teams;
+  writePlatformBinding(b);
+  return teams;
+}

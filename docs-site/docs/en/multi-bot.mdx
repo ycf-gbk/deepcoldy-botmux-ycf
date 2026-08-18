@@ -1,0 +1,34 @@
+# Multi-bot Collaboration
+
+Multiple Lark bots can run on the same machine, and each bot can be bound to a different CLI. Add them to the same group and you can have different models "duke it out" against each other.
+
+<video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421535360_multibot-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+
+## Routing rules
+
+- **Just you and one bot in the group**: no @ needed, it responds automatically (under the default @ policy this requires both "1 human + 1 bot"; a multi-human group needs an @ even with a single bot).
+- **Multiple bots / multiple humans in the group**: use `@mention` to specify the recipient.
+- `@botA @botB /t <prompt>`: have **each @-mentioned bot** open its own independent session on this message, each running on its own (both bots anchor on your `/t` message and share the same thread, but the sessions are independent).
+
+## Letting bots know each other
+
+botmux discovers bots in the current Lark group via the group bot roster by default. **Cross-deployment** recognition has two paths, both entering the **same team-trust gate and skipping `/grant`**: one is the federation in the Dashboard "Teams" panel (invite someone else's deployment into the same team, create cross-deployment groups); the other is central-platform team-sync (the platform pushes down teams and groups). A plain `/group` or the Dashboard "New Group" flow creates an ordinary same-deployment group that uses neither path and carries no cross-deployment team trust.
+
+For handoffs, have the model check:
+
+- `botmux bots list`: lists bots in the current group, capability tags, `openId`, and `mentionable`.
+- The `<available_bots>` block in the message context: hints which bots can be relayed to.
+
+After that, a bot can explicitly @ the other from its own session with `botmux send --mention <the other's openId>`, triggering the relay.
+
+> A hard fact about cross-bot collaboration: **if you don't `--mention` the other bot, it won't be triggered at all**.
+
+## Typical scenarios
+
+- **Code review**: have Claude Code and Codex review the same MR together, picking holes in each other's views when they disagree.
+- **Design review**: two AIs each propose a solution and find flaws in each other's.
+- **Write/review separation**: one writes, one reviews, iterating to convergence.
+
+Configuration is minimal: one Lark app per bot, add them to the same group, and the processes are fully isolated.
+
+> Related: use [Roles & Teams](/en/roles) to give each bot a persona and capability tags; use [One-click session group](/en/group) to add multiple bots to a new group in one sentence; use [Session Relay](/en/relay) to move a session into a collaboration group.
