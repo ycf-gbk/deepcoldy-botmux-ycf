@@ -495,22 +495,15 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical && !grantedScopes.has(s.name));
 
     if (missingCritical.length === 0) {
-      // All critical scopes present. If an opt-in feature added a non-critical
-      // scope that isn't granted yet, top it up SILENTLY — but only when a cached
-      // Feishu web session already exists (disableQrLogin makes a missing session
-      // fail cleanly with no second QR code and no DM). This makes `botmux restart`
-      // actually pick up newly-declared optional scopes (e.g. the foreign-bot
-      // group-message scope) without the admin having to visit the Open Platform,
-      // while a bot with nothing missing — or no web session — behaves exactly as
-      // before (no API call / no prompt / no nag).
-      if (missingOptional.length > 0 && brand === 'feishu') {
-        const toppedUp = await tryAutoFixScopes(larkAppId, bot, brand, [], missingOptional,
-          { disableQrLogin: true, silent: true });
-        if (toppedUp) {
-          logger.info(`[${larkAppId}] auto-topped-up ${missingOptional.length} optional scope(s): ${missingOptional.map(s => s.name).join('、')}`);
-          return;
-        }
-        logger.debug(`[${larkAppId}] optional scope(s) missing (${missingOptional.map(s => s.name).join('、')}); no cached web session to auto-apply — leaving to opt-in feature owner`);
+      // Optional scopes are deliberately report-only. They are feature-specific
+      // (for example, im:feed_group_v1:* is only used for Dashboard session
+      // labels) and must never cause a background manifest import, app-version
+      // publish, QR login, or approval request on daemon startup.
+      if (missingOptional.length > 0) {
+        logger.warn(
+          `[${larkAppId}] 缺少 ${missingOptional.length} 项可选权限（不影响核心功能，未自动申请）：` +
+          `${missingOptional.map(s => `${s.name}（${s.desc}）`).join('、')}`,
+        );
       }
       logger.info(`[${larkAppId}] all critical scopes granted (${BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).length} checked)`);
       return;
